@@ -34,7 +34,7 @@ jobs:
         env:
           GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
           # TOMTOM_API_KEY: ${{ secrets.TOMTOM_API_KEY }}   # if using --provider tomtom
-        run: python render.py --provider google --out site/boston-traffic.png
+        run: python render.py --lat 42.3298938 --lon -71.097972 --zoom 14.75 --provider google --out site/boston-traffic.png
 
       - uses: actions/upload-pages-artifact@v3
         with:
