@@ -1,36 +1,26 @@
 #!/usr/bin/env python3
 """
-Render a traffic-density map (default: Boston, MA) for a TRMNL e-ink display.
+Render a live traffic map (default: Boston, MA) for a TRMNL e-ink display,
+using the Google Map Tiles API.
 
-Providers:
-  google (default)  Google Map Tiles API: a styled roadmap with the live
-                    traffic layer. Needs GOOGLE_MAPS_API_KEY.
-  tomtom            TomTom base map plus raster traffic-flow tiles.
-                    Needs TOMTOM_API_KEY.
-
-Pipeline:
-  1. Work out which 256px web-mercator tiles cover an 800x480 window
-     centred on --lat/--lon at --zoom.
-  2. Fetch the tiles. For Google, the base map is styled in flat "key" colours
-     (white land, pure-blue water, black labels) so that only traffic is
-     coloured.
-  3. Collapse the colours into four grey levels that read well on e-ink:
-        black       heavy / stopped (red, dark red)
-        dark grey   slow (orange / yellow); also map labels
-        light grey  free flowing (green)            [--hide-free drops it]
-        white       background; water gets a light checker texture
-  4. Draw a title, timestamp, legend and the provider's attribution, then
-     write a 2-bit greyscale PNG (TRMNL OG, firmware >= 1.6) or a 1-bit PNG
-     (--bits 1).
+  1. Create a Map Tiles session: styled roadmap + live traffic layer. The style
+     paints land/roads white, water pure blue and labels black, so traffic is
+     the only colour left. On TRMNL X, tiles are requested at 2x (high-DPI).
+  2. Fetch and stitch the tiles covering the display.
+  3. Sort pixels into classes (heavy / slow / free / water / label / background)
+     and paint each class with the device's grey palette:
+        TRMNL OG  800x480,   4 greys (2-bit PNG, firmware >= 1.6)
+        TRMNL X   1872x1404, 16 greys (4-bit PNG)
+  4. Add title, timestamp, legend and Google attribution; write the PNG.
 
 Usage:
-  GOOGLE_MAPS_API_KEY=... python render.py --out site/boston-traffic.png
-  TOMTOM_API_KEY=...      python render.py --provider tomtom
+  GOOGLE_MAPS_API_KEY=... python render.py --device x --out site/boston-traffic.png
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import io
 import math
 import os
 import sys
@@ -41,15 +31,29 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
-import png  # pypng: writes true 1-/2-bit greyscale PNGs
+import png  # pypng: writes true 1/2/4-bit greyscale PNGs
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
-TILE = 256
-W, H = 800, 480  # TRMNL OG resolution
+# --------------------------------------------------------------------------
+# Devices
+# --------------------------------------------------------------------------
+DEVICES = {
+    #        width  height  bits  hi-DPI tiles  UI scale  max PNG bytes
+    "og": dict(w=800, h=480, bits=2, hidpi=False, ui=1.0, limit=90_000),
+    "x": dict(w=1872, h=1404, bits=4, hidpi=True, ui=1.8, limit=750_000),
+}
 
-# Grey levels (also the 2-bit PNG sample values: 0 = black ... 3 = white)
-BLACK, DARK, LIGHT, WHITE = 0, 1, 2, 3
+# Set in main() from the device preset.
+W, H = 800, 480
+TILE = 256
+
+# Pixel classes (what a pixel *means*; the palette decides its grey).
+HEAVY, SLOW, FREE, BG, WATER, LABEL = 0, 1, 2, 3, 4, 5
+
+# Grey value per class, by bit depth (0 = black, max = white).
+PALETTE_4BIT = {HEAVY: 0, SLOW: 6, FREE: 11, BG: 15, WATER: 13, LABEL: 3}
+PALETTE_2BIT = {HEAVY: 0, SLOW: 1, FREE: 2, BG: 3, LABEL: 1}  # water: checker of 2/3
 
 
 # --------------------------------------------------------------------------
@@ -70,18 +74,12 @@ def global_px_to_latlon(x: float, y: float, z: int) -> tuple[float, float]:
     return lat, lon
 
 
-def fetch_tile(session: requests.Session, url: str, params: dict,
-               cache_file: Path | None) -> Image.Image:
-    if cache_file and cache_file.exists():
-        return Image.open(cache_file).convert("RGBA")
+def fetch_tile(session: requests.Session, url: str, params: dict) -> Image.Image:
     last_err = None
     for attempt in range(3):
         try:
             r = session.get(url, params=params, timeout=15)
             r.raise_for_status()
-            if cache_file:
-                cache_file.parent.mkdir(parents=True, exist_ok=True)
-                cache_file.write_bytes(r.content)
             return Image.open(BytesIO(r.content)).convert("RGBA")
         except requests.RequestException as e:
             last_err = e
@@ -90,7 +88,7 @@ def fetch_tile(session: requests.Session, url: str, params: dict,
     raise RuntimeError(f"tile fetch failed for {url.split('?')[0]}: {last_err}")
 
 
-def mosaic(session, url_tmpl, params, z, x0, y0, cache_dir: Path | None, tag: str):
+def mosaic(session, url_tmpl, params, z, x0, y0):
     """Stitch the tiles covering [x0, x0+W) x [y0, y0+H) and crop to W x H."""
     tx0, ty0 = int(x0 // TILE), int(y0 // TILE)
     tx1, ty1 = int((x0 + W - 1) // TILE), int((y0 + H - 1) // TILE)
@@ -99,8 +97,10 @@ def mosaic(session, url_tmpl, params, z, x0, y0, cache_dir: Path | None, tag: st
 
     def get(t):
         tx, ty = t
-        cf = cache_dir / f"{tag}_{z}_{tx}_{ty}.png" if cache_dir else None
-        return t, fetch_tile(session, url_tmpl.format(z=z, x=tx, y=ty), params, cf)
+        img = fetch_tile(session, url_tmpl.format(z=z, x=tx, y=ty), params)
+        if img.size != (TILE, TILE):
+            img = img.resize((TILE, TILE), Image.LANCZOS)
+        return t, img
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         for (tx, ty), img in ex.map(get, jobs):
@@ -110,22 +110,8 @@ def mosaic(session, url_tmpl, params, z, x0, y0, cache_dir: Path | None, tag: st
     return canvas.crop((ox, oy, ox + W, oy + H))
 
 
-def _hsv_arrays(img: Image.Image):
-    rgb = np.asarray(img.convert("RGB")).astype(np.int16)
-    hsv = np.asarray(img.convert("RGB").convert("HSV")).astype(np.float32)
-    hue = hsv[..., 0] * 360.0 / 255.0
-    sat = hsv[..., 1] / 255.0
-    lum = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
-    return rgb, hue, sat, lum
-
-
-def _checker():
-    yy, xx = np.mgrid[0:H, 0:W]
-    return ((xx + yy) % 2) == 0
-
-
 # --------------------------------------------------------------------------
-# Provider: Google Map Tiles API
+# Google Map Tiles API
 # --------------------------------------------------------------------------
 GOOGLE_TILE_URL = "https://tile.googleapis.com/v1/2dtiles/{z}/{x}/{y}"
 GOOGLE_SESSION_URL = "https://tile.googleapis.com/v1/createSession"
@@ -146,23 +132,33 @@ GOOGLE_STYLES = [
 ]
 
 
-def render_google(s: requests.Session, args, x0, y0):
+def render_google(s: requests.Session, args, hidpi: bool):
+    global TILE
     key = os.environ.get("GOOGLE_MAPS_API_KEY") or sys.exit("Set GOOGLE_MAPS_API_KEY")
 
-    r = s.post(GOOGLE_SESSION_URL, params={"key": key}, timeout=15, json={
+    body = {
         "mapType": "roadmap",
         "language": "en-US",
         "region": "US",
         "layerTypes": ["layerTraffic"],
         "styles": GOOGLE_STYLES,
-    })
+    }
+    if hidpi:
+        # Same ground coverage per tile, twice the pixels in each direction.
+        body.update({"scale": "scaleFactor2x", "highDpi": True})
+
+    r = s.post(GOOGLE_SESSION_URL, params={"key": key}, timeout=15, json=body)
     if not r.ok:
         sys.exit(f"createSession failed: HTTP {r.status_code} {r.text[:300]}")
-    token = r.json()["session"]
+    sess = r.json()
+    token = sess["session"]
+    TILE = int(sess.get("tileWidth") or (512 if hidpi else 256))
+
+    cx, cy = latlon_to_global_px(args.lat, args.lon, args.zoom)
+    x0, y0 = cx - W / 2, cy - H / 2
 
     # No disk cache: Google's terms only allow caching as the HTTP headers permit.
-    img = mosaic(s, GOOGLE_TILE_URL, {"session": token, "key": key},
-                 args.zoom, x0, y0, None, "google")
+    img = mosaic(s, GOOGLE_TILE_URL, {"session": token, "key": key}, args.zoom, x0, y0)
 
     # Attribution text for exactly this viewport (required by Google's policies).
     north, west = global_px_to_latlon(x0, y0, args.zoom)
@@ -177,74 +173,35 @@ def render_google(s: requests.Session, args, x0, y0):
     except (requests.RequestException, ValueError):
         pass
 
-    return img, classify_google(img, args), attribution
+    return img, classify(img, args), attribution
 
 
-def classify_google(img: Image.Image, args) -> np.ndarray:
-    rgb, hue, sat, lum = _hsv_arrays(img)
+def classify(img: Image.Image, args) -> np.ndarray:
+    rgb = np.asarray(img.convert("RGB")).astype(np.int16)
+    hsv = np.asarray(img.convert("RGB").convert("HSV")).astype(np.float32)
+    hue = hsv[..., 0] * 360.0 / 255.0
+    sat = hsv[..., 1] / 255.0
+    lum = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
     r_, g_, b_ = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    lvl = np.full((H, W), WHITE, dtype=np.uint8)
 
+    cls = np.full((H, W), BG, dtype=np.uint8)
     water = (b_ > 150) & (r_ < 110) & (g_ < 110)
-    lvl[water & _checker()] = LIGHT
-
-    labels = (sat < 0.25) & (lum < args.label_lum)
-    lvl[labels] = DARK
+    cls[water] = WATER
+    cls[(sat < 0.25) & (lum < args.label_lum)] = LABEL
 
     coloured = (sat > 0.35) & ~water
     green = coloured & (hue >= 70) & (hue < 170)
     orange = coloured & (hue >= 15) & (hue < 70)            # "slow"
     red = coloured & ((hue < 15) | (hue >= 330))            # red + dark red
     if not args.hide_free:
-        lvl[green] = LIGHT
-    lvl[orange] = DARK
-    lvl[red] = BLACK
-    return lvl
+        cls[green] = FREE
+    cls[orange] = SLOW
+    cls[red] = HEAVY
+    return cls
 
 
 # --------------------------------------------------------------------------
-# Provider: TomTom
-# --------------------------------------------------------------------------
-TOMTOM_BASE_URL = "https://api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png"
-TOMTOM_FLOW_URL = "https://api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png"
-
-
-def render_tomtom(s: requests.Session, args, x0, y0):
-    key = os.environ.get("TOMTOM_API_KEY") or sys.exit("Set TOMTOM_API_KEY")
-    base = mosaic(s, TOMTOM_BASE_URL, {"key": key}, args.zoom, x0, y0, args.cache_dir, "tt-base")
-    flow = mosaic(s, TOMTOM_FLOW_URL, {"key": key, "thickness": args.thickness},
-                  args.zoom, x0, y0, None, "tt-flow")
-    debug = Image.alpha_composite(base, flow)
-    return debug, classify_tomtom(base, flow, args), "© TomTom"
-
-
-def classify_tomtom(base: Image.Image, flow: Image.Image, args) -> np.ndarray:
-    lvl = np.full((H, W), WHITE, dtype=np.uint8)
-
-    rgb, _, _, lum = _hsv_arrays(base)
-    r_, g_, b_ = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    water = (b_ > r_ + 20) & (b_ >= g_) & (lum > 110)
-    lvl[water & _checker()] = LIGHT
-    lvl[lum < args.label_lum] = DARK
-
-    alpha = np.asarray(flow)[..., 3] > 100
-    _, hue, sat, _ = _hsv_arrays(flow)
-    closed = alpha & (sat < 0.18)
-    green = alpha & ~closed & (hue >= 75) & (hue < 170)
-    yellow = alpha & ~closed & (hue >= 42) & (hue < 75)
-    red_orange = alpha & ~closed & ~green & ~yellow
-    if not args.hide_free:
-        lvl[green] = LIGHT
-    lvl[yellow] = DARK
-    lvl[red_orange | closed] = BLACK
-    return lvl
-
-
-PROVIDERS = {"google": render_google, "tomtom": render_tomtom}
-
-
-# --------------------------------------------------------------------------
-# Annotation + output
+# Annotation (drawn in class space, so it follows the palette)
 # --------------------------------------------------------------------------
 def load_font(size: int, bold: bool = False):
     for p in [
@@ -257,84 +214,114 @@ def load_font(size: int, bold: bool = False):
     return ImageFont.load_default(size=size)
 
 
-def annotate(lvl: np.ndarray, title: str, tz: str, attribution: str) -> np.ndarray:
-    img = Image.fromarray(lvl, mode="L")
+def annotate(cls: np.ndarray, title: str, tz: str, attribution: str, u: float) -> np.ndarray:
+    img = Image.fromarray(cls, mode="L")
     d = ImageDraw.Draw(img)
-    d.fontmode = "1"  # no anti-aliasing: crisp on e-ink
+    d.fontmode = "1"  # no anti-aliasing: pixels must stay valid class ids
+
+    def S(v):  # scale a size by the device UI factor
+        return int(round(v * u))
 
     stamp = dt.datetime.now(ZoneInfo(tz)).strftime("%a %-I:%M %p")
 
-    f_title, f_small = load_font(22, bold=True), load_font(15)
-    box_w = int(max(d.textlength(title, font=f_title), d.textlength(stamp, font=f_small))) + 20
-    d.rectangle([0, 0, box_w, 56], fill=WHITE, outline=BLACK, width=2)
-    d.text((10, 6), title, font=f_title, fill=BLACK)
-    d.text((10, 34), stamp, font=f_small, fill=BLACK)
+    f_title, f_small, f_tiny = load_font(S(22), bold=True), load_font(S(15)), load_font(S(12))
+    pad = S(10)
+    box_w = int(max(d.textlength(title, font=f_title), d.textlength(stamp, font=f_small))) + 2 * pad
+    d.rectangle([0, 0, box_w, S(56)], fill=BG, outline=HEAVY, width=max(2, S(2)))
+    d.text((pad, S(6)), title, font=f_title, fill=HEAVY)
+    d.text((pad, S(34)), stamp, font=f_small, fill=HEAVY)
 
-    items = [(BLACK, "Heavy / stopped"), (DARK, "Slow"), (LIGHT, "Free flow")]
-    lw, lh = 170, 18 * len(items) + 14
-    x0, y0 = W - lw - 6, H - lh - 22
-    d.rectangle([x0, y0, x0 + lw, y0 + lh], fill=WHITE, outline=BLACK, width=2)
+    items = [(HEAVY, "Heavy / stopped"), (SLOW, "Slow"), (FREE, "Free flow")]
+    row = S(18)
+    lw, lh = S(190), row * len(items) + S(14)
+    x0, y0 = W - lw - S(6), H - lh - S(22)
+    d.rectangle([x0, y0, x0 + lw, y0 + lh], fill=BG, outline=HEAVY, width=max(2, S(2)))
     for i, (shade, label) in enumerate(items):
-        y = y0 + 8 + i * 18
-        d.rectangle([x0 + 10, y + 3, x0 + 38, y + 11], fill=shade, outline=BLACK)
-        d.text((x0 + 46, y - 1), label, font=f_small, fill=BLACK)
+        y = y0 + S(8) + i * row
+        d.rectangle([x0 + S(10), y + S(3), x0 + S(38), y + S(11)], fill=shade, outline=HEAVY)
+        d.text((x0 + S(46), y - S(1)), label, font=f_small, fill=HEAVY)
 
     # Attribution strip, bottom-right, kept clear of everything else.
-    f_tiny = load_font(12)
     aw = int(d.textlength(attribution, font=f_tiny))
-    d.rectangle([W - aw - 10, H - 17, W, H], fill=WHITE)
-    d.text((W - aw - 5, H - 16), attribution, font=f_tiny, fill=BLACK)
+    d.rectangle([W - aw - S(10), H - S(17), W, H], fill=BG)
+    d.text((W - aw - S(5), H - S(16)), attribution, font=f_tiny, fill=HEAVY)
 
     return np.asarray(img, dtype=np.uint8)
 
 
-def write_png(lvl: np.ndarray, out: Path, bits: int):
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if bits == 2:
-        rows = lvl  # 0..3 is exactly the 2-bit grey scale
-    else:
-        yy, xx = np.mgrid[0:H, 0:W]
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+def to_grey(cls: np.ndarray, bits: int) -> np.ndarray:
+    yy, xx = np.mgrid[0:H, 0:W]
+    out = np.zeros((H, W), dtype=np.uint8)
+    if bits == 4:
+        for c, g in PALETTE_4BIT.items():
+            out[cls == c] = g
+    elif bits == 2:
+        for c, g in PALETTE_2BIT.items():
+            out[cls == c] = g
+        checker = ((xx + yy) % 2) == 0
+        out[cls == WATER] = np.where(checker[cls == WATER], 2, 3)
+    else:  # 1-bit: ordered patterns approximate the greys
         even = (xx % 2 == 0) & (yy % 2 == 0)
-        rows = np.ones((H, W), dtype=np.uint8)
-        rows[lvl == BLACK] = 0
-        rows[(lvl == DARK) & ~even] = 0     # ~75% black
-        rows[(lvl == LIGHT) & even] = 0     # ~25% black
-    with open(out, "wb") as fh:
-        png.Writer(W, H, greyscale=True, bitdepth=bits).write(fh, rows.tolist())
+        sparse = (xx % 4 == 0) & (yy % 4 == 0)
+        out[:] = 1
+        out[(cls == HEAVY) | (cls == LABEL)] = 0
+        out[(cls == SLOW) & ~even] = 0        # ~75% black
+        out[(cls == FREE) & even] = 0         # ~25% black
+        out[(cls == WATER) & sparse] = 0      # ~6% black
+    return out
+
+
+def encode_png(grey: np.ndarray, bits: int) -> bytes:
+    buf = io.BytesIO()
+    png.Writer(W, H, greyscale=True, bitdepth=bits, compression=9).write(buf, grey.tolist())
+    return buf.getvalue()
 
 
 def main():
+    global W, H
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--provider", choices=PROVIDERS, default="google")
+    ap.add_argument("--device", choices=DEVICES, default="og", help="og (800x480) or x (1872x1404)")
+    ap.add_argument("--portrait", action="store_true", help="render in portrait orientation")
     ap.add_argument("--lat", type=float, default=42.355)
     ap.add_argument("--lon", type=float, default=-71.075)
-    ap.add_argument("--zoom", type=int, default=12, help="12 ≈ 22 km wide in Boston; 13 ≈ 11 km")
+    ap.add_argument("--zoom", type=int, default=12, help="12 ≈ 22-26 km wide around Boston; 13 ≈ half that")
     ap.add_argument("--title", default="Boston traffic")
     ap.add_argument("--tz", default="America/New_York")
     ap.add_argument("--out", type=Path, default=Path("site/boston-traffic.png"))
-    ap.add_argument("--bits", type=int, choices=[1, 2], default=2,
-                    help="2 = 4-grey PNG (OG fw >= 1.6), 1 = black/white")
+    ap.add_argument("--bits", type=int, choices=[1, 2, 4],
+                    help="override grey depth (default: 2 for og, 4 for x)")
     ap.add_argument("--hide-free", action="store_true", help="don't draw free-flowing roads")
     ap.add_argument("--label-lum", type=int, default=90,
-                    help="pixels darker than this (and unsaturated) become grey labels")
-    ap.add_argument("--thickness", type=int, default=8, help="[tomtom] flow line thickness 1-20")
-    ap.add_argument("--cache-dir", type=Path, default=Path(".tile-cache"),
-                    help="[tomtom] base-map tile cache")
+                    help="pixels darker than this (and unsaturated) become labels")
     ap.add_argument("--debug", action="store_true", help="also save the raw colour mosaic")
     args = ap.parse_args()
 
-    cx, cy = latlon_to_global_px(args.lat, args.lon, args.zoom)
-    x0, y0 = cx - W / 2, cy - H / 2
+    dev = DEVICES[args.device]
+    W, H = (dev["h"], dev["w"]) if args.portrait else (dev["w"], dev["h"])
+    bits = args.bits or dev["bits"]
 
     with requests.Session() as s:
-        s.headers["User-Agent"] = "trmnl-traffic-map/1.1"
-        raw, lvl, attribution = PROVIDERS[args.provider](s, args, x0, y0)
+        s.headers["User-Agent"] = "trmnl-traffic-map/1.2"
+        raw, cls, attribution = render_google(s, args, dev["hidpi"])
 
     if args.debug:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
         raw.save(args.out.with_name("debug-raw.png"))
 
-    write_png(annotate(lvl, args.title, args.tz, attribution), args.out, args.bits)
-    print(f"wrote {args.out} ({args.out.stat().st_size} bytes, {args.bits}-bit, {args.provider})")
+    cls = annotate(cls, args.title, args.tz, attribution, dev["ui"])
+    data = encode_png(to_grey(cls, bits), bits)
+    if len(data) > dev["limit"]:
+        # The device silently refuses oversized images; fail loudly instead
+        # so the previously published image stays live.
+        sys.exit(f"PNG is {len(data):,} bytes, over the {args.device} limit of "
+                 f"{dev['limit']:,}. Try a lower --bits or a higher --zoom.")
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_bytes(data)
+    print(f"wrote {args.out} ({W}x{H}, {bits}-bit, {len(data):,} bytes)")
 
 
 if __name__ == "__main__":
